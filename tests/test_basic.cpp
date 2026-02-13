@@ -1,115 +1,120 @@
-#include <atomic>
+// Copyright (c) 2024 liudegui. MIT License.
+
+#include "test_types.hpp"
+
 #include <catch2/catch_test_macros.hpp>
-#include <chrono>
-#include <cp/consumer_producer.hpp>
-#include <thread>
+#include <wp/worker_pool.hpp>
 
-struct SimpleJob {
-  int value{0};
-};
-
-TEST_CASE("Basic enqueue and consume", "[basic]") {
-  std::atomic<int> processed{0};
-
-  cp::Config cfg;
-  cfg.name = "basic";
-  cfg.worker_num = 1;
-  cfg.queue_size = 16;
-  cfg.hi_queue_size = 4;
-
-  cp::ConsumerProducer<SimpleJob> cp(cfg, [&](std::shared_ptr<SimpleJob> job, bool) -> int32_t {
-    processed.fetch_add(job->value, std::memory_order_relaxed);
-    return 0;
-  });
-
-  cp.Start();
-
-  for (int i = 1; i <= 10; ++i) {
-    auto job = std::make_shared<SimpleJob>();
-    job->value = i;
-    cp.AddJob(job);
-  }
-
-  cp.Shutdown();
-  REQUIRE(processed.load() == 55);  // 1+2+...+10
+TEST_CASE("WorkerPool default config", "[basic]") {
+  wp::Config cfg;
+  CHECK(cfg.worker_num == 1U);
+  CHECK(cfg.worker_queue_depth == wp::kDefaultWorkerQueueDepth);
+  CHECK(cfg.priority == 0);
 }
 
-TEST_CASE("AddJobWaitDone blocks until processed", "[basic]") {
-  std::atomic<int> last_processed{0};
-
-  cp::Config cfg;
-  cfg.name = "wait_done";
-  cfg.worker_num = 1;
-  cfg.queue_size = 8;
-  cfg.hi_queue_size = 4;
-
-  cp::ConsumerProducer<SimpleJob> cp(cfg, [&](std::shared_ptr<SimpleJob> job, bool) -> int32_t {
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    last_processed.store(job->value, std::memory_order_relaxed);
-    return 0;
-  });
-
-  cp.Start();
-
-  auto job = std::make_shared<SimpleJob>();
-  job->value = 42;
-  cp.AddJobWaitDone(job);
-
-  // After AddJobWaitDone returns, the job must have been processed
-  REQUIRE(last_processed.load() == 42);
-
-  cp.Shutdown();
-}
-
-TEST_CASE("FlushAndPause then Resume", "[basic]") {
-  std::atomic<int> count{0};
-
-  cp::Config cfg;
-  cfg.name = "flush";
+TEST_CASE("WorkerPool construct and destroy without start", "[basic]") {
+  wp::Config cfg;
+  cfg.name = "test";
   cfg.worker_num = 2;
-  cfg.queue_size = 32;
-  cfg.hi_queue_size = 4;
 
-  cp::ConsumerProducer<SimpleJob> cp(cfg, [&](std::shared_ptr<SimpleJob>, bool) -> int32_t {
-    count.fetch_add(1, std::memory_order_relaxed);
-    return 0;
-  });
-
-  cp.Start();
-
-  for (int i = 0; i < 20; ++i) {
-    cp.AddJob(std::make_shared<SimpleJob>());
-  }
-
-  cp.FlushAndPause();
-  REQUIRE(count.load() == 20);
-
-  // Add more after resume
-  cp.Resume();
-  for (int i = 0; i < 5; ++i) {
-    cp.AddJob(std::make_shared<SimpleJob>());
-  }
-
-  cp.Shutdown();
-  REQUIRE(count.load() == 25);
+  wp::WorkerPool<TestPayload> pool(cfg);
+  CHECK_FALSE(pool.IsRunning());
+  CHECK_FALSE(pool.IsPaused());
+  CHECK(pool.WorkerCount() == 2U);
 }
 
-TEST_CASE("Stats reporting", "[basic]") {
-  cp::Config cfg;
-  cfg.name = "stats";
-  cfg.worker_num = 1;
-  cfg.queue_size = 8;
-  cfg.hi_queue_size = 4;
+TEST_CASE("WorkerPool start and shutdown", "[basic]") {
+  wp::Config cfg;
+  cfg.name = "lifecycle";
+  cfg.worker_num = 2;
+  cfg.worker_queue_depth = 64;
 
-  cp::ConsumerProducer<SimpleJob> cp(cfg, [](std::shared_ptr<SimpleJob>, bool) -> int32_t { return 0; });
+  wp::WorkerPool<TestPayload> pool(cfg);
+  pool.RegisterHandler<TaskA>([](const TaskA&, const mccc::MessageHeader&) {});
+  pool.Start();
+  CHECK(pool.IsRunning());
 
-  cp.Start();
-  for (int i = 0; i < 5; ++i) {
-    cp.AddJob(std::make_shared<SimpleJob>());
+  pool.Shutdown();
+  CHECK_FALSE(pool.IsRunning());
+}
+
+TEST_CASE("WorkerPool double start is safe", "[basic]") {
+  wp::Config cfg;
+  cfg.name = "double-start";
+
+  wp::WorkerPool<TestPayload> pool(cfg);
+  pool.RegisterHandler<TaskA>([](const TaskA&, const mccc::MessageHeader&) {});
+  pool.Start();
+  pool.Start();  // Should not crash or double-create threads
+  CHECK(pool.IsRunning());
+  pool.Shutdown();
+}
+
+TEST_CASE("WorkerPool double shutdown is safe", "[basic]") {
+  wp::Config cfg;
+  cfg.name = "double-shutdown";
+
+  wp::WorkerPool<TestPayload> pool(cfg);
+  pool.RegisterHandler<TaskA>([](const TaskA&, const mccc::MessageHeader&) {});
+  pool.Start();
+  pool.Shutdown();
+  pool.Shutdown();  // Should not crash
+  CHECK_FALSE(pool.IsRunning());
+}
+
+TEST_CASE("SpscQueue basic push pop", "[basic]") {
+  wp::SpscQueue<int32_t> q(4);
+  CHECK(q.Empty());
+  CHECK(q.Size() == 0U);
+  CHECK(q.Capacity() == 4U);
+
+  CHECK(q.TryPush(10));
+  CHECK(q.TryPush(20));
+  CHECK(q.Size() == 2U);
+  CHECK_FALSE(q.Empty());
+
+  int32_t val = 0;
+  CHECK(q.TryPop(val));
+  CHECK(val == 10);
+  CHECK(q.TryPop(val));
+  CHECK(val == 20);
+  CHECK(q.Empty());
+}
+
+TEST_CASE("SpscQueue full and wraparound", "[basic]") {
+  wp::SpscQueue<int32_t> q(4);
+
+  // Fill queue
+  for (int32_t i = 0; i < 4; ++i) {
+    CHECK(q.TryPush(i));
   }
-  cp.Shutdown();
+  CHECK_FALSE(q.TryPush(99));  // Full
 
-  std::string stats = cp.GetStatsString();
-  REQUIRE_FALSE(stats.empty());
-  REQUIRE(stats.find("stats") != std::string::npos);
+  // Pop all
+  int32_t val = 0;
+  for (int32_t i = 0; i < 4; ++i) {
+    CHECK(q.TryPop(val));
+    CHECK(val == i);
+  }
+  CHECK_FALSE(q.TryPop(val));  // Empty
+
+  // Wraparound: push again
+  for (int32_t i = 10; i < 14; ++i) {
+    CHECK(q.TryPush(i));
+  }
+  for (int32_t i = 10; i < 14; ++i) {
+    CHECK(q.TryPop(val));
+    CHECK(val == i);
+  }
+}
+
+TEST_CASE("SpscQueue rounds up to power of 2", "[basic]") {
+  wp::SpscQueue<int32_t> q(5);
+  CHECK(q.Capacity() == 8U);
+
+  wp::SpscQueue<int32_t> q2(1);
+  CHECK(q2.Capacity() == 1U);
+
+  wp::SpscQueue<int32_t> q3(3);
+  CHECK(q3.Capacity() == 4U);
 }

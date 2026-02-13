@@ -1,231 +1,198 @@
+// Copyright (c) 2024 liudegui. MIT License.
+// Performance benchmark for WorkerPool.
+
+#include <cstdint>
 #include <cstdio>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cp/consumer_producer.hpp>
-#include <memory>
 #include <thread>
+#include <variant>
 #include <vector>
+#include <wp/worker_pool.hpp>
 
 struct BenchJob {
-  int64_t enqueue_time{0};
-  int id{0};
+  uint64_t seq;
+  uint64_t timestamp_ns;
 };
 
-// Prevent compiler from optimizing away
-static void DoNotOptimize(void* ptr) {
-  asm volatile("" : : "r,m"(ptr) : "memory");
+using BenchPayload = std::variant<BenchJob>;
+using BenchBus = mccc::AsyncBus<BenchPayload>;
+
+static uint64_t NowNs() {
+  auto now = std::chrono::steady_clock::now();
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
 }
 
-// ---------------------------------------------------------------------------
-// Test 1: Single-producer single-consumer throughput
-// ---------------------------------------------------------------------------
-static void BenchSPSC() {
-  constexpr int kJobCount = 100000;
-  std::atomic<int> consumed{0};
+// ==========================================================================
+// Test 1: SPSC throughput (1 producer, 1 worker)
+// ==========================================================================
 
-  cp::Config cfg;
+static void BenchSpsc() {
+  static std::atomic<uint64_t> g_count{0U};
+  g_count.store(0U);
+
+  BenchBus::Instance().ResetStatistics();
+
+  wp::Config cfg;
   cfg.name = "spsc";
   cfg.worker_num = 1;
-  cfg.queue_size = 1024;
-  cfg.hi_queue_size = 16;
+  cfg.worker_queue_depth = 4096;
 
-  cp::ConsumerProducer<BenchJob> cp(cfg, [&](std::shared_ptr<BenchJob> job, bool) -> int32_t {
-    DoNotOptimize(job.get());
-    consumed.fetch_add(1, std::memory_order_relaxed);
-    return 0;
-  });
+  wp::WorkerPool<BenchPayload> pool(cfg);
+  pool.RegisterHandler<BenchJob>(
+      [](const BenchJob&, const mccc::MessageHeader&) { g_count.fetch_add(1U, std::memory_order_relaxed); });
 
-  cp.Start();
+  pool.Start();
 
-  auto start = std::chrono::high_resolution_clock::now();
-  for (int i = 0; i < kJobCount; ++i) {
-    cp.AddJob(std::make_shared<BenchJob>(), false, true);
+  constexpr uint64_t kJobs = 100000U;
+  auto start = std::chrono::steady_clock::now();
+
+  for (uint64_t i = 0U; i < kJobs; ++i) {
+    while (!pool.Submit(BenchJob{i, 0U})) {
+      std::this_thread::yield();
+    }
   }
-  cp.Shutdown();
-  auto end = std::chrono::high_resolution_clock::now();
 
-  auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-  double jobs_per_sec = static_cast<double>(kJobCount) / (static_cast<double>(ns) / 1e9);
-  std::printf("  1P x 1C: %8.2f K jobs/sec\n", jobs_per_sec / 1e3);
+  // Wait for all
+  while (g_count.load(std::memory_order_acquire) < kJobs) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  double sec = std::chrono::duration<double>(elapsed).count();
+  double kps = static_cast<double>(kJobs) / sec / 1000.0;
+
+  std::printf("SPSC throughput (100K jobs): %.0f K jobs/sec\n", kps);
+
+  pool.Shutdown();
 }
 
-// ---------------------------------------------------------------------------
+// ==========================================================================
 // Test 2: Multi-producer throughput
-// ---------------------------------------------------------------------------
-static void BenchMultiProducer(uint32_t num_producers, uint32_t num_workers) {
-  constexpr int kJobsPerProducer = 25000;
-  std::atomic<int> consumed{0};
+// ==========================================================================
 
-  cp::Config cfg;
+static void BenchMultiProducer(uint32_t producers, uint32_t workers) {
+  static std::atomic<uint64_t> g_count{0U};
+  g_count.store(0U);
+
+  BenchBus::Instance().ResetStatistics();
+
+  wp::Config cfg;
   cfg.name = "mp";
-  cfg.worker_num = num_workers;
-  cfg.queue_size = 1024;
-  cfg.hi_queue_size = 64;
+  cfg.worker_num = workers;
+  cfg.worker_queue_depth = 4096;
 
-  cp::ConsumerProducer<BenchJob> cp(cfg, [&](std::shared_ptr<BenchJob> job, bool) -> int32_t {
-    DoNotOptimize(job.get());
-    consumed.fetch_add(1, std::memory_order_relaxed);
-    return 0;
-  });
+  wp::WorkerPool<BenchPayload> pool(cfg);
+  pool.RegisterHandler<BenchJob>(
+      [](const BenchJob&, const mccc::MessageHeader&) { g_count.fetch_add(1U, std::memory_order_relaxed); });
 
-  cp.Start();
+  pool.Start();
 
-  auto start = std::chrono::high_resolution_clock::now();
+  constexpr uint64_t kJobsPerProducer = 25000U;
+  const uint64_t total_jobs = producers * kJobsPerProducer;
 
-  std::vector<std::thread> producers;
-  producers.reserve(num_producers);
-  for (uint32_t p = 0; p < num_producers; ++p) {
-    producers.emplace_back([&]() {
-      for (int i = 0; i < kJobsPerProducer; ++i) {
-        cp.AddJob(std::make_shared<BenchJob>(), false, true);
+  auto start = std::chrono::steady_clock::now();
+
+  std::vector<std::thread> threads;
+  threads.reserve(producers);
+  for (uint32_t p = 0U; p < producers; ++p) {
+    threads.emplace_back([&pool, p]() {
+      for (uint64_t i = 0U; i < kJobsPerProducer; ++i) {
+        while (!pool.Submit(BenchJob{p * kJobsPerProducer + i, 0U})) {
+          std::this_thread::yield();
+        }
       }
     });
   }
-  for (auto& t : producers)
+
+  for (auto& t : threads) {
     t.join();
+  }
 
-  cp.Shutdown();
-  auto end = std::chrono::high_resolution_clock::now();
+  while (g_count.load(std::memory_order_acquire) < total_jobs) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
 
-  int total_jobs = static_cast<int>(num_producers) * kJobsPerProducer;
-  auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-  double jobs_per_sec = static_cast<double>(total_jobs) / (static_cast<double>(ns) / 1e9);
-  std::printf("  %uP x %uC: %8.2f K jobs/sec\n", num_producers, num_workers, jobs_per_sec / 1e3);
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  double sec = std::chrono::duration<double>(elapsed).count();
+  double kps = static_cast<double>(total_jobs) / sec / 1000.0;
+
+  std::printf("%uP x %uC throughput: %.0f K jobs/sec\n", producers, workers, kps);
+
+  pool.Shutdown();
 }
 
-// ---------------------------------------------------------------------------
-// Test 3: Enqueue-to-consume latency distribution
-// ---------------------------------------------------------------------------
-static void BenchLatencyDistribution() {
-  constexpr int kSamples = 50000;
-  std::vector<int64_t> latencies(kSamples);
-  std::atomic<int> idx{0};
+// ==========================================================================
+// Test 3: End-to-end latency
+// ==========================================================================
 
-  cp::Config cfg;
-  cfg.name = "latency";
+static void BenchLatency() {
+  static std::vector<uint64_t> g_latencies;
+  static std::mutex g_mtx;
+  g_latencies.clear();
+  g_latencies.reserve(50000);
+
+  BenchBus::Instance().ResetStatistics();
+
+  wp::Config cfg;
+  cfg.name = "lat";
   cfg.worker_num = 1;
-  cfg.queue_size = 256;
-  cfg.hi_queue_size = 16;
+  cfg.worker_queue_depth = 4096;
 
-  cp::ConsumerProducer<BenchJob> cp(cfg, [&](std::shared_ptr<BenchJob> job, bool) -> int32_t {
-    auto now = std::chrono::high_resolution_clock::now();
-    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-    int cur = idx.fetch_add(1, std::memory_order_relaxed);
-    if (cur < kSamples) {
-      latencies[cur] = now_ns - job->enqueue_time;
-    }
-    return 0;
+  wp::WorkerPool<BenchPayload> pool(cfg);
+  pool.RegisterHandler<BenchJob>([](const BenchJob& job, const mccc::MessageHeader&) {
+    uint64_t now = NowNs();
+    uint64_t lat = now - job.timestamp_ns;
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_latencies.push_back(lat);
   });
 
-  cp.Start();
+  pool.Start();
 
-  for (int i = 0; i < kSamples; ++i) {
-    auto job = std::make_shared<BenchJob>();
-    auto now = std::chrono::high_resolution_clock::now();
-    job->enqueue_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-    job->id = i;
-    cp.AddJob(job, false, true);
-    // Small delay to avoid overwhelming the queue
+  constexpr uint64_t kSamples = 50000U;
+  for (uint64_t i = 0U; i < kSamples; ++i) {
+    BenchJob job{i, NowNs()};
+    while (!pool.Submit(std::move(job))) {
+      std::this_thread::yield();
+    }
+    // Pace: avoid flooding
     if (i % 100 == 0) {
       std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
   }
 
-  cp.Shutdown();
+  pool.FlushAndPause();
 
-  int n = idx.load();
-  if (n > kSamples)
-    n = kSamples;
-  std::sort(latencies.begin(), latencies.begin() + n);
+  std::sort(g_latencies.begin(), g_latencies.end());
+  auto p50 = g_latencies[g_latencies.size() * 50 / 100];
+  auto p95 = g_latencies[g_latencies.size() * 95 / 100];
+  auto p99 = g_latencies[g_latencies.size() * 99 / 100];
+  auto pmax = g_latencies.back();
 
-  auto percentile = [&](double pct) -> int64_t {
-    int p = static_cast<int>(pct / 100.0 * (n - 1));
-    return latencies[p];
-  };
+  std::printf("\nLatency distribution (%lu samples):\n", static_cast<unsigned long>(g_latencies.size()));
+  std::printf("  P50:  %lu us\n", static_cast<unsigned long>(p50 / 1000U));
+  std::printf("  P95:  %lu us\n", static_cast<unsigned long>(p95 / 1000U));
+  std::printf("  P99:  %lu us\n", static_cast<unsigned long>(p99 / 1000U));
+  std::printf("  Max:  %lu us\n", static_cast<unsigned long>(pmax / 1000U));
 
-  std::printf("  P50:  %8lld ns\n", static_cast<long long>(percentile(50)));
-  std::printf("  P95:  %8lld ns\n", static_cast<long long>(percentile(95)));
-  std::printf("  P99:  %8lld ns\n", static_cast<long long>(percentile(99)));
-  std::printf("  Max:  %8lld ns\n", static_cast<long long>(latencies[n - 1]));
+  pool.Resume();
+  pool.Shutdown();
 }
 
-// ---------------------------------------------------------------------------
-// Test 4: Priority scheduling verification
-// ---------------------------------------------------------------------------
-static void BenchPriorityScheduling() {
-  constexpr int kLowJobs = 1000;
-  constexpr int kHighJobs = 100;
-  std::atomic<int> hi_count{0};
-  std::atomic<int> lo_count{0};
-  std::atomic<int> hi_preferred{0};
-
-  cp::Config cfg;
-  cfg.name = "prio_bench";
-  cfg.worker_num = 1;
-  cfg.queue_size = 256;
-  cfg.hi_queue_size = 64;
-
-  cp::ConsumerProducer<BenchJob> cp(cfg, [&](std::shared_ptr<BenchJob> job, bool preferred) -> int32_t {
-    if (job->id >= 10000) {
-      hi_count.fetch_add(1, std::memory_order_relaxed);
-      if (preferred)
-        hi_preferred.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      lo_count.fetch_add(1, std::memory_order_relaxed);
-    }
-    return 0;
-  });
-
-  cp.Start();
-
-  // Mix low and high priority
-  for (int i = 0; i < kLowJobs; ++i) {
-    auto job = std::make_shared<BenchJob>();
-    job->id = i;
-    cp.AddJob(job, false, true);
-    if (i % 10 == 0 && i / 10 < kHighJobs) {
-      auto hi_job = std::make_shared<BenchJob>();
-      hi_job->id = 10000 + i / 10;
-      cp.AddJob(hi_job, true);
-    }
-  }
-
-  cp.Shutdown();
-
-  std::printf("  High-prio processed: %d (preferred: %d)\n", hi_count.load(), hi_preferred.load());
-  std::printf("  Low-prio  processed: %d\n", lo_count.load());
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 int main() {
-  std::printf("========================================\n");
-  std::printf("  ConsumerProducer Benchmark Report\n");
-  std::printf("========================================\n\n");
+  std::printf("=== WorkerPool Benchmark ===\n\n");
 
-  std::printf("[1] Single-producer single-consumer (100K jobs)\n");
-  BenchSPSC();
-  std::printf("\n");
+  BenchSpsc();
 
-  std::printf("[2] Multi-producer throughput (25K jobs/producer)\n");
+  std::printf("\nMulti-producer throughput:\n");
   BenchMultiProducer(1, 1);
-  BenchMultiProducer(2, 1);
-  BenchMultiProducer(4, 1);
-  BenchMultiProducer(4, 2);
+  BenchMultiProducer(2, 2);
   BenchMultiProducer(4, 4);
-  std::printf("\n");
 
-  std::printf("[3] Enqueue-to-consume latency (50K samples)\n");
-  BenchLatencyDistribution();
-  std::printf("\n");
+  BenchLatency();
 
-  std::printf("[4] Priority scheduling verification\n");
-  BenchPriorityScheduling();
-  std::printf("\n");
-
-  std::printf("========================================\n");
+  std::printf("\nDone.\n");
   return 0;
 }

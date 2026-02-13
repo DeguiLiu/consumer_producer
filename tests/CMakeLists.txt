@@ -10,13 +10,12 @@ include(Catch)
 
 find_package(Threads REQUIRED)
 
-add_executable(cp_tests
+add_executable(wp_tests
     test_basic.cpp
-    test_priority.cpp
-    test_discard.cpp
+    test_submit.cpp
     test_concurrent.cpp
-    test_stats.cpp
-    test_edge_cases.cpp)
-target_link_libraries(cp_tests Catch2::Catch2WithMain consumer_producer Threads::Threads)
-target_compile_options(cp_tests PRIVATE -Wall -Wextra -Wpedantic)
-catch_discover_tests(cp_tests)
+    test_flush.cpp
+    test_stats.cpp)
+target_link_libraries(wp_tests Catch2::Catch2WithMain worker_pool Threads::Threads)
+target_compile_options(wp_tests PRIVATE -Wall -Wextra -Wpedantic)
+catch_discover_tests(wp_tests)

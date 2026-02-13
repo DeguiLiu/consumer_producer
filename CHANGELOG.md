@@ -1,5 +1,40 @@
 # Changelog
 
+## v3.0.0 (feature/worker-pool)
+
+### Breaking Change
+
+- Replaced `cp::ConsumerProducer` with `wp::WorkerPool` based on mccc message bus
+- Upgraded from C++14 to C++17
+- Changed namespace from `cp` to `wp`
+- Changed task type from `std::shared_ptr<Worker>` to `std::variant<Types...>` (value type)
+- Changed callback from `std::function` to function pointer
+
+### Architecture
+
+- Lock-free MPSC ingress via mccc::AsyncBus (CAS-based ring buffer)
+- Per-worker lock-free SPSC queues (Lamport queue)
+- Dedicated dispatcher thread (ProcessBatch loop + round-robin dispatch)
+- Type-erased handler dispatch via compile-time trampoline functions
+- Priority-based admission control (LOW/MEDIUM/HIGH via mccc)
+
+### Performance
+
+- SPSC throughput: 3602 K jobs/sec (vs CP v2.0: 1068 K, 3.4x improvement)
+- Zero heap allocation in hot path (envelope embedded in ring buffer)
+- Function pointer handlers (zero overhead vs std::function)
+- Cache-line-aligned SPSC counters (no false sharing)
+
+### Testing
+
+- 22 test cases: basic lifecycle, submit, concurrent, flush, stats
+- ASan + TSan + UBSan clean
+- -fno-exceptions -fno-rtti compatible
+
+### Dependency
+
+- mccc (https://github.com/DeguiLiu/mccc) via CMake FetchContent
+
 ## v2.0.0
 
 ### Performance

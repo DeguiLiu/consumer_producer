@@ -1,39 +1,69 @@
-// basic_example.cpp
-// Demonstrates basic ConsumerProducer usage.
+// Copyright (c) 2024 liudegui. MIT License.
+// Basic usage example for WorkerPool.
 
+#include <cstdint>
 #include <cstdio>
 
-#include <cp/consumer_producer.hpp>
-#include <memory>
-#include <string>
+#include <chrono>
+#include <thread>
+#include <variant>
+#include <wp/worker_pool.hpp>
 
-struct Task {
-  int id;
-  std::string data;
+struct SensorData {
+  int32_t sensor_id;
+  float temperature;
 };
 
+struct MotorCommand {
+  int32_t motor_id;
+  int32_t speed;
+};
+
+using MyPayload = std::variant<SensorData, MotorCommand>;
+
+static void HandleSensor(const SensorData& data, const mccc::MessageHeader& hdr) {
+  std::printf("[%lu] Sensor %d: temp=%.1f\n", static_cast<unsigned long>(hdr.msg_id), data.sensor_id,
+              static_cast<double>(data.temperature));
+}
+
+static void HandleMotor(const MotorCommand& cmd, const mccc::MessageHeader& hdr) {
+  std::printf("[%lu] Motor %d: speed=%d\n", static_cast<unsigned long>(hdr.msg_id), cmd.motor_id, cmd.speed);
+}
+
 int main() {
-  cp::Config cfg;
+  wp::Config cfg;
   cfg.name = "demo";
   cfg.worker_num = 2;
-  cfg.queue_size = 32;
-  cfg.hi_queue_size = 8;
+  cfg.worker_queue_depth = 64;
 
-  cp::ConsumerProducer<Task> producer(cfg, [](std::shared_ptr<Task> job, bool preferred) -> int32_t {
-    std::printf("[%s] Task %d: %s\n", preferred ? "PREF" : "DROP", job->id, job->data.c_str());
-    return 0;
-  });
+  wp::WorkerPool<MyPayload> pool(cfg);
+  pool.RegisterHandler<SensorData>(HandleSensor);
+  pool.RegisterHandler<MotorCommand>(HandleMotor);
 
-  producer.Start();
+  pool.Start();
 
-  for (int i = 0; i < 20; ++i) {
-    auto task = std::make_shared<Task>();
-    task->id = i;
-    task->data = "payload_" + std::to_string(i);
-    producer.AddJob(task);
+  // Submit jobs
+  for (int32_t i = 0; i < 5; ++i) {
+    pool.Submit(SensorData{i, 20.0f + static_cast<float>(i)});
+    pool.Submit(MotorCommand{i, 1000 + i * 100});
   }
 
-  producer.Shutdown();
-  producer.PrintStats();
+  // Flush and show stats
+  pool.FlushAndPause();
+
+  auto stats = pool.GetStats();
+  std::printf("\n--- Stats ---\n");
+  std::printf("dispatched: %lu\n", static_cast<unsigned long>(stats.dispatched));
+  std::printf("processed:  %lu\n", static_cast<unsigned long>(stats.processed));
+  std::printf("bus published: %lu\n", static_cast<unsigned long>(stats.bus_stats.messages_published));
+
+  pool.Resume();
+
+  // SubmitSync example
+  std::printf("\n--- SubmitSync ---\n");
+  pool.SubmitSync(SensorData{99, 42.0f});
+
+  pool.Shutdown();
+  std::printf("Done.\n");
   return 0;
 }

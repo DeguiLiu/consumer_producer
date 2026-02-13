@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, feature/worker-pool]
   pull_request:
     branches: [master, main]
 
@@ -50,9 +50,7 @@ jobs:
         run: |
           cd build
           echo "=== basic_example ==="
-          ./examples/cp_basic_example
-          echo "=== priority_example ==="
-          ./examples/cp_priority_example
+          ./examples/wp_basic_example
 
   build-with-options:
     runs-on: ubuntu-24.04
@@ -64,7 +62,7 @@ jobs:
           mkdir build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_FLAGS="-fno-exceptions -fno-rtti" \
-            -DCP_BUILD_TESTS=OFF
+            -DWP_BUILD_TESTS=OFF
           cmake --build . -j$(nproc)
 
   sanitizers:
@@ -83,7 +81,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}" \
-            -DCP_BUILD_EXAMPLES=OFF
+            -DWP_BUILD_EXAMPLES=OFF
           cmake --build . -j$(nproc)
       - name: Run tests
         run: cd build && ctest --output-on-failure
