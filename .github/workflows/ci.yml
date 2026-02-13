@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86_64
+            compiler: g++
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            compiler: g++
+          - os: macos-latest
+            arch: macOS
+            compiler: clang++
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.arch }} (${{ matrix.compiler }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (Release)
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake --build . -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Run tests (Release)
+        run: cd build && ctest --output-on-failure
+
+      - name: Build (Debug)
+        run: |
+          mkdir build-dbg && cd build-dbg
+          cmake .. -DCMAKE_BUILD_TYPE=Debug
+          cmake --build . -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Run tests (Debug)
+        run: cd build-dbg && ctest --output-on-failure
+
+      - name: Run examples
+        run: |
+          cd build
+          echo "=== basic_example ==="
+          ./examples/cp_basic_example
+          echo "=== priority_example ==="
+          ./examples/cp_priority_example
+
+  build-with-options:
+    runs-on: ubuntu-24.04
+    name: build options (-fno-exceptions -fno-rtti)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with -fno-exceptions -fno-rtti
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-fno-exceptions -fno-rtti" \
+            -DCP_BUILD_TESTS=OFF
+          cmake --build . -j$(nproc)
+
+  sanitizers:
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread, undefined]
+    runs-on: ubuntu-24.04
+    name: ${{ matrix.sanitizer }} sanitizer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with ${{ matrix.sanitizer }} sanitizer
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}" \
+            -DCP_BUILD_EXAMPLES=OFF
+          cmake --build . -j$(nproc)
+      - name: Run tests
+        run: cd build && ctest --output-on-failure
+
+  code-quality:
+    runs-on: ubuntu-24.04
+    name: code quality
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-format python3-pip
+          pip3 install cpplint
+      - name: clang-format check
+        run: |
+          find include tests examples -name '*.hpp' -o -name '*.cpp' | \
+            xargs clang-format --dry-run --Werror --style=file
+      - name: cpplint check
+        run: cpplint --recursive include/ tests/ examples/
