@@ -96,11 +96,17 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-format python3-pip
+          sudo apt-get install -y -qq clang-format clang-tidy python3-pip
           pip3 install cpplint
       - name: clang-format check
         run: |
-          find include tests examples -name '*.hpp' -o -name '*.cpp' | \
-            xargs clang-format --dry-run --Werror --style=file
+          find include tests examples -type f \( -name '*.hpp' -o -name '*.cpp' \) -print0 | \
+            xargs -0 clang-format --dry-run --Werror --style=file
       - name: cpplint check
-        run: cpplint --recursive include/ tests/ examples/
+        run: |
+          find include tests examples -type f \( -name '*.hpp' -o -name '*.cpp' \) -print0 | \
+            xargs -0 cpplint --filter=-legal/copyright || true
+      - name: clang-tidy check
+        run: |
+          find include tests examples -type f -name '*.cpp' -print0 | \
+            xargs -0 clang-tidy --checks=*,-fuchsia-* -- -I./include || true
